@@ -1,5 +1,4 @@
 import streamlit as st
-from streamlit_modal import Modal
 import time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
