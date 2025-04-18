@@ -1,4 +1,6 @@
 import streamlit as st
+from streamlit_modal import Modal
+import time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
@@ -21,6 +23,11 @@ if "page" not in st.session_state:
     st.session_state.page = "Home"
 if "form_data" not in st.session_state:
     st.session_state.form_data = {}
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "show_login_form" not in st.session_state:
+    st.session_state.show_login_form = False
+
 
 # Helper: Clear form
 def clear_form():
@@ -38,6 +45,7 @@ subjects_ws = sheet.worksheet("Subjects")
 faculty_ws = sheet.worksheet("Faculty")
 chapters_ws = sheet.worksheet("Subject_Chapter_Map")
 master_ws = sheet.worksheet("Central_Weekly_Progress")
+pendingEmails_ws = sheet.worksheet('PendingEmails')
 
 @st.cache_data(ttl=600)  # Cache for 10 minutes (adjust as needed)
 def get_countries():
@@ -106,10 +114,6 @@ def submit_to_progress_sheet(form_data):
     progress_ws.append_row(row)
 
 def merge_weekly_to_master(sheet):
-    # Load worksheets
-    batches_ws = sheet.worksheet("Batches")
-    centers_ws = sheet.worksheet("Centers")
-    master_ws = sheet.worksheet("Central_Weekly_Progress")
 
     # Load reference data
     batches_data = batches_ws.get_all_values()[1:]  # Skip header
@@ -166,46 +170,92 @@ def merge_weekly_to_master(sheet):
             except Exception as e:
                 st.warning(f"⚠️ Skipped a row in {ws.title} due to error: {e}")
 
-import requests
+def safe_post_with_retry(url, payload, max_retries=3, timeout=10):
+    attempt = 0
+    backoff = 2  # seconds to wait before retrying
+
+    while attempt < max_retries:
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+
+            if response.status_code == 200:
+                return True, "✅ Success: " + response.text
+            else:
+                attempt += 1
+                print(f"⚠️ Attempt {attempt}: Failed with status {response.status_code}. Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+
+        except Exception as e:
+            attempt += 1
+            print(f"⚠️ Attempt {attempt}: Exception occurred: {e}. Retrying in {backoff} seconds...")
+            time.sleep(backoff)
+            backoff *= 2
+
+    return False, f"❌ All {max_retries} retries failed."
+
 
 def notify_via_gas(center, email, batch_id, week):
-    url = "https://script.google.com/macros/s/AKfycbwxepWUExiZ1XCeUuZyOnrU3jWLg1-tm77GAKrbVgstXE5Aqag4LhE80D2KL3s1ilXhXw/exec"
+    # Step 1: Append entry to PendingEmails sheet
+    try:
+       # Append row
+       pendingEmails_ws.append_row([
+            str(datetime.now()), 
+            center, 
+            email, 
+            batch_id, 
+            week, 
+            "Pending"
+        ])
+    except Exception as e:
+        print(f"⚠️ Error appending to sheet: {str(e)}")
+        return f"⚠️ Error appending to sheet: {str(e)}"
+
+    # Step 2: Trigger Apps Script to send emails
+    url = "https://script.google.com/macros/s/AKfycbz_pqgwlTdyfkJJmgYGNy9zEDagBmKemTJyiAk36xgtwVNQ8qa2tUcIM9Ge9WY31gsOrg/exec"
     payload = {
-        "centerName": center,
-        "emailAddress": email,
-        "batchId": batch_id,
-        "week": week
+        "action": "sendPendingEmailsNow"  # Adjust in GAS to understand this
     }
 
-    try:
-        response = requests.post(url, json=payload)  # Ensure the data is sent as JSON
-        if response.status_code == 200:
-            return "Email sent!"
-        else:
-            return f"❌ Failed: {response.text}"
-    except Exception as e:
-        return f"⚠️ Error: {str(e)}"
+    success, message = safe_post_with_retry(url, payload)
+
 
 
 # Home Page
 if st.session_state.page == "Home": 
     # Centered Title using markdown and CSS
     st.markdown("""
-        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500&display=swap" rel="stylesheet">
-        <style>
-        .title-text {
-            text-align: center;
-            font-family: 'Poppins', sans-serif;
-            font-size: 3em;
-            color: #1E4D2B;
-            margin-top: 30px;
-        }
-        </style>
-        <div class="title-text">GLOBAL ED-TECH</div>
-    """, unsafe_allow_html=True)
+    <style>
+    .main-title {
+        font-family: 'Poppins', sans-serif;
+        text-align: center;
+        font-size: 3.5rem;
+        font-weight: 600;
+        color: #2C3E50;
+        margin-top: 30px;
+        margin-bottom: 10px;
+    }
+    .subtitle {
+        text-align: center;
+        font-size: 1.5rem;
+        font-weight: 300;
+        color: #95A5A6;
+        margin-bottom: 30px;
+    }
+    </style>
+    <div class="main-title">🌎 GLOBAL ED-TECH</div>
+    <div class="subtitle">Empowering Learning, Globally</div>
+""", unsafe_allow_html=True)
 
     # Add vertical spacing to push buttons down
     st.markdown("<div style='height: 20vh;'></div>", unsafe_allow_html=True)
+    
+    # Get admin credentials from st.secrets
+    ADMIN_USERNAME = st.secrets["credentials"]["admin_username"]
+    ADMIN_PASSWORD = st.secrets["credentials"]["admin_password"]
+
+    # Check if user is already logged in by checking session state
+    
     col1, col2, col3 = st.columns([2,1,1])
 
     with col1:
@@ -214,16 +264,74 @@ if st.session_state.page == "Home":
             st.rerun()
     with col3:
             if st.button("🔒Admin Access"):
-                st.session_state.page = "Admin"
+                st.session_state.show_login_form = True  # Toggle login form display
+                st.session_state.page = "Home"  # Stay on home while login form shows
                 st.rerun()
+    # --- Styling for expander ---
+    st.markdown("""
+        <style>
+        div.streamlit-expanderHeader {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #3498DB;
+        }
+        .stTextInput>div>div>input {
+            font-size: 1.2rem;
+            padding: 10px;
+        }
+        .stButton>button {
+            font-size: 1.1rem;
+            padding: 10px 20px;
+            border-radius: 8px;
+            background-color: #3498DB;
+            color: white;
+            border: none;
+            transition: background-color 0.3s;
+        }
+        .stButton>button:hover {
+            background-color: #1ABC9C;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Now outside the button condition, check if login form should be shown
+    if st.session_state.show_login_form and not st.session_state.logged_in:
+        with st.expander("🔐 Admin Login", expanded=True):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            login_btn = st.button("Login Now")
+
+            if login_btn:
+                if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                    st.success("✅ Login successful!")
+                    st.session_state.logged_in = True
+                    st.session_state.page = "Admin"
+                    st.session_state.show_login_form = False
+                    st.rerun()
+                else:
+                    st.error("❌ Incorrect username or password. Try again.")
+
+    # After login
+    if st.session_state.logged_in and st.session_state.page == "Admin":
+        st.title("🔒 Admin Dashboard")
+
 
 # Admin Dashboard
+if st.session_state.logged_in:
+    # Admin-specific content
+    st.write("Welcome, Admin!")
+
+
 if st.session_state.page == "Admin":
     if "missing_batches" not in st.session_state:
         st.session_state.missing_batches = []
 
-    if "notified_batches" not in st.session_state:
+    if 'notified_batches' not in st.session_state:
         st.session_state.notified_batches = set()
+
+    if 'last_notified_time' not in st.session_state:
+        st.session_state.last_notified_time = dict()
+
 
     # Centered Title using markdown and CSS
     st.markdown("<h1 style='text-align: center;'>👩‍💼 Admin Dashboard</h1>", unsafe_allow_html=True)
@@ -242,63 +350,7 @@ if st.session_state.page == "Admin":
     with col3:
         check_button = st.button("Check Missing Submissions")
     
-    
-
-    if check_button or st.session_state.missing_batches:
-
-        if check_button:
-        # Fetch and store missing entries
-            active_batches = [row for row in get_batches_data() if len(row) >= 3]
-            batch_to_center = {row[2]: row[1] for row in active_batches}
-            center_data = get_centers_by_country()
-            center_email_map = {row[2]: row[3] for row in center_data if len(row) > 3}
-            master_ws = sheet.worksheet("Central_Weekly_Progress")
-            master_data = master_ws.get_all_values()[1:]
-
-            submitted = set((row[3], row[7]) for row in master_data if len(row) > 5)
-
-            missing = []
-            for row in active_batches:
-                batch_id = row[2]
-                center = row[1]
-                if (batch_id, str(week_number)) not in submitted:
-                    email = center_email_map.get(center, "N/A")
-                    missing.append({
-                        "Country": row[0] if len(row) > 0 else "Unknown",
-                        "Center": center,
-                        "Batch ID": batch_id,
-                        "Email": email
-                    })
-
-            st.session_state.missing_batches = missing
-            st.session_state.notified_batches = set()  # Reset notifications on re-check
-        
-        if st.session_state.missing_batches:
-            st.warning(f"{len(st.session_state.missing_batches)} batches have not submitted Progress for Week {week_number}.")
-
-            for entry in st.session_state.missing_batches:
-                with st.container():
-                    cols = st.columns([2, 2, 2, 3, 2])
-                    cols[0].markdown(f"{entry['Center']}")
-                    cols[1].markdown(f"{entry['Batch ID']}")
-
-                    key = f"notify_{entry['Batch ID']}"
-                    if cols[2].button("Notify", key=key):
-                        if entry['Batch ID'] not in st.session_state.notified_batches:
-                            result = notify_via_gas(entry['Center'], entry['Email'], entry['Batch ID'], week_number)
-                            st.session_state.notified_batches.add(entry['Batch ID'])
-                            st.success(f"📧 Notified {entry['Center']} to submit Week {week_number} progress.")
-                        else:
-                            st.info(f"Already notified {entry['Center']}.")
-        else:
-            st.success("✅ All active batches have submitted their progress for this week.")
-
-    
-        if st.button("Clear Results"):
-            st.session_state.missing_batches = []
-            st.session_state.notified_batches = set()
-
-        st.markdown("---")
+    st.markdown("---")
 
     # Put all disabled buttons in a single row
     reg_col1, reg_col2, reg_col3, reg_col4, reg_col5 = st.columns(5)
@@ -330,22 +382,104 @@ if st.session_state.page == "Admin":
         )
 
     with col3:
-        st.markdown(
-        """
-        <form action="#">
-            <button type="submit" name="home_button" style="background-color:#28a745;color:white;padding:12px 20px;font-size:16px;border:none;border-radius:8px;cursor:pointer;">
-                🏠 Home
-            </button>
-        </form>
-        """,
-        unsafe_allow_html=True
-        )
+        # Add a logout button
+        if st.button("Logout"):
+            st.session_state.logged_in = False  # Reset login status
+            st.session_state.page = "Home"  # Redirect to home page or initial page
+            st.rerun()  # Rerun the app to reflect changes
 
-    # Detect if the "home_button" form was submitted
-    if "home_button" in st.session_state.get("query_params", {}):
-        st.session_state.page = "Home"
-        st.rerun()
 
+    if check_button or st.session_state.missing_batches:
+
+        if check_button:
+        # Fetch and store missing entries
+            active_batches = [row for row in get_batches_data() if len(row) >= 3]
+            batch_to_center = {row[2]: row[1] for row in active_batches}
+            center_data = get_centers_by_country()
+            center_email_map = {row[2]: row[3] for row in center_data if len(row) > 3}
+            master_ws = sheet.worksheet("Central_Weekly_Progress")
+            master_data = master_ws.get_all_values()[1:]
+
+            submitted = set((row[3], row[7]) for row in master_data if len(row) > 5)
+
+            missing = []
+            for row in active_batches:
+                batch_id = row[2]
+                center = row[1]
+                if (batch_id, str(week_number)) not in submitted:
+                    email = center_email_map.get(center, "N/A")
+                    missing.append({
+                        "Country": row[0] if len(row) > 0 else "Unknown",
+                        "Center": center,
+                        "Batch ID": batch_id,
+                        "Email": email
+                    })
+
+            st.session_state.missing_batches = missing
+            st.session_state.notified_batches = set()  # Reset notifications on re-check
+            st.session_state.last_notified_time = dict()  # ALSO reset last_notified_time
+
+        
+        if st.session_state.missing_batches:
+            st.warning(f"{len(st.session_state.missing_batches)} batches have not submitted Progress for Week {week_number}.")
+
+            for entry in st.session_state.missing_batches:
+                with st.container():
+                    cols = st.columns([2, 2, 2, 3, 2])
+                    cols[0].markdown(f"{entry['Center']}")
+                    cols[1].markdown(f"{entry['Batch ID']}")
+
+                    key = f"notify_{entry['Batch ID']}"
+
+                    already_notified = entry['Batch ID'] in st.session_state.notified_batches
+
+                    notify_button = cols[2].button(
+                        "Notify" if not already_notified else "Notified ✅",
+                        key=key,
+                        disabled=already_notified
+                    )
+
+                    # If notify button clicked
+                    if notify_button and not already_notified:
+                        result = notify_via_gas(entry['Center'], entry['Email'], entry['Batch ID'], week_number)
+
+                        # Update session state
+                        st.session_state.notified_batches.add(entry['Batch ID'])
+                        st.session_state.last_notified_time[entry['Batch ID']] = time.time()
+                        
+                        # ✅ Save a success message into session state
+                        st.session_state.success_message = f"📧 Notified {entry['Center']} to submit Week {week_number} progress."
+
+                        # ✅ Trigger rerun
+                        st.rerun()
+
+                    # After possible rerun, show success message if available
+                    if "success_message" in st.session_state:
+                        st.success(st.session_state.success_message)
+                        # 🧹 Optional: Clear after showing
+                        del st.session_state.success_message
+
+                    # Show timer if already notified
+                    if already_notified and entry['Batch ID'] in st.session_state.last_notified_time:
+                        seconds_ago = int(time.time() - st.session_state.last_notified_time[entry['Batch ID']])
+                        minutes_ago = seconds_ago // 60
+
+                        if minutes_ago == 0:
+                            cols[3].markdown(f"✅ Notified just now")
+                        else:
+                            cols[3].markdown(f"⏰ Notified {minutes_ago} min ago")
+
+            # If no missing batches
+            if not st.session_state.missing_batches:
+                st.success("✅ All active batches have submitted their progress for this week.")
+            else:
+                if st.button("Clear Results"):
+                    st.session_state.missing_batches = []
+                    st.session_state.notified_batches = set()
+                    st.session_state.last_notified_time = dict()
+                    st.rerun()
+
+        
 # Update Weekly Progress Page
 elif st.session_state.page == "Update":
     st.title("📝 Weekly Progress Form")
@@ -426,11 +560,14 @@ elif st.session_state.page == "Update":
                 st.success("✅ Progress submitted!")
                 st.rerun()
         elif cleared:
-                for k in ["selected_country", "selected_center", "selected_batch", "selected_subject", "selected_faculty", "selected_chapters", "selected_week"]:
-                    if k in st.session_state:
-                        del st.session_state[k]
-                st.rerun()
+            keys_to_clear = [
+                "selected_country", "selected_center", "selected_batch",
+                "selected_subject", "selected_faculty", "selected_chapters", "selected_week"
+            ]
+            for k in keys_to_clear:
+                st.session_state.pop(k, None)  # safer: pop with default
+            st.rerun()
         elif home:
             st.session_state.page = "Home"
             st.rerun()
-        
+
